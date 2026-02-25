@@ -11,6 +11,10 @@ async function getAttributeFast(locator, name, timeoutMs = 350) {
   return locator.getAttribute(name, {timeout: timeoutMs}).catch(() => null);
 }
 
+async function getTextFast(locator, timeoutMs = 350) {
+  return locator.textContent({timeout: timeoutMs}).catch(() => "");
+}
+
 async function getTrackHrefFromCard(card) {
   try {
     return await card.evaluate(node => {
@@ -43,7 +47,9 @@ export async function parseTrackResults(page, maxResults = 60) {
 
     const ariaLabel = normalizeText(await button.getAttribute("aria-label").catch(() => ""));
     const titleFromAria = ariaLabel.replace(/^Download\s+/i, "").trim();
-    const titleRaw = await card.locator("h3").first().textContent().catch(() => "");
+    const titleRaw = titleFromAria
+      ? ""
+      : await getTextFast(card.locator("h3").first(), 320);
     const title = titleFromAria || normalizeText(titleRaw) || "Unknown";
 
     const lines = (await card.locator("p").allTextContents().catch(() => []))
@@ -80,21 +86,13 @@ export async function parseTrackResults(page, maxResults = 60) {
 export async function parseAlbumTrackResults(page, albumPath, maxResults = 200, meta = {}) {
   const albumTitle =
     normalizeText(
-      await page
-        .locator(".album-page .album-title")
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(page.locator(".album-page .album-title").first(), 420)
     ) ||
     normalizeText(meta?.albumTitle || "") ||
     "Unknown Album";
   const albumArtist =
     normalizeText(
-      await page
-        .locator(".album-page .album-artist-row")
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(page.locator(".album-page .album-artist-row").first(), 420)
     ) || normalizeText(meta?.albumArtist || "");
   const albumArtwork =
     (await getAttributeFast(page.locator(".album-page img").first(), "src")) ||
@@ -113,11 +111,7 @@ export async function parseAlbumTrackResults(page, albumPath, maxResults = 200, 
     );
 
     const title = normalizeText(
-      await row
-        .locator('button[class*="track-row__title"]')
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(row.locator('button[class*="track-row__title"]').first(), 320)
     );
     if (!title) {
       continue;
@@ -125,32 +119,16 @@ export async function parseAlbumTrackResults(page, albumPath, maxResults = 200, 
 
     const artist =
       normalizeText(
-        await row
-          .locator('[class*="track-row__artist"]')
-          .first()
-          .textContent()
-          .catch(() => "")
+        await getTextFast(row.locator('[class*="track-row__artist"]').first(), 320)
       ) || albumArtist || "Unknown";
     const trackNumber = normalizeText(
-      await row
-        .locator('[class*="track-row__number"]')
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(row.locator('[class*="track-row__number"]').first(), 280)
     );
     const tagText = normalizeText(
-      await row
-        .locator('[class*="track-row__tags"]')
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(row.locator('[class*="track-row__tags"]').first(), 280)
     ).replace(new RegExp(`^\\s*${BULLET}\\s*`), "");
     const durationText = normalizeText(
-      await row
-        .locator('[class*="track-row__duration"]')
-        .first()
-        .textContent()
-        .catch(() => "")
+      await getTextFast(row.locator('[class*="track-row__duration"]').first(), 280)
     );
     const duration = parseDuration(durationText);
     const artwork = await getAttributeFast(row.locator("img").first(), "src");
@@ -187,7 +165,9 @@ export async function parseAlbumResults(page, maxResults = 60) {
 
     const ariaLabel = normalizeText(await button.getAttribute("aria-label").catch(() => ""));
     const titleFromAria = ariaLabel.replace(/^Download\s+/i, "").trim();
-    const titleRaw = await card.locator("h3").first().textContent().catch(() => "");
+    const titleRaw = titleFromAria
+      ? ""
+      : await getTextFast(card.locator("h3").first(), 320);
     const title = titleFromAria || normalizeText(titleRaw) || "Unknown";
 
     const lines = (await card.locator("p").allTextContents().catch(() => []))
@@ -228,7 +208,9 @@ export async function parsePlaylistResults(page, maxResults = 60) {
 
   for (let i = 0; i < limit; i += 1) {
     const card = cards.nth(i);
-    const title = normalizeText(await card.locator("h3").first().textContent().catch(() => "")) || "Unknown";
+    const title =
+      normalizeText(await getTextFast(card.locator("h3").first(), 320)) ||
+      "Unknown";
     const lines = (await card.locator("p").allTextContents().catch(() => []))
       .map(normalizeText)
       .filter(Boolean);

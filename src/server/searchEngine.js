@@ -1,5 +1,6 @@
 import {searchTracksFast} from "../fastSearch.js";
 import {getAlbumTracks, searchSongs} from "../search.js";
+import {BASE_URL} from "../config.js";
 import {createLookupStore} from "./search/lookup.js";
 import {createTrackSearchCache} from "./search/trackSearchCache.js";
 import {
@@ -15,43 +16,31 @@ import {
   withTimeout,
 } from "./helpers.js";
 
+function timeoutFromEnv(name, fallback) {
+  const raw = Number(process.env[name]);
+  if (Number.isFinite(raw) && raw >= 1_000) {
+    return Math.round(raw);
+  }
+  return fallback;
+}
+
 const TIMEOUTS = {
-  fastTrack: 12_000,
-  browserInit: 10_000,
-  trackFallback: 12_000,
-  trackFallbackPipeline: 20_000,
-  search: 18_000,
-  searchPipeline: 30_000,
-  resolveFast: 18_000,
-  resolveSteady: 36_000,
+  fastTrack: timeoutFromEnv("FAST_TRACK_TIMEOUT_MS", 12_000),
+  browserInit: timeoutFromEnv("BROWSER_INIT_TIMEOUT_MS", 10_000),
+  trackFallback: timeoutFromEnv("TRACK_FALLBACK_TIMEOUT_MS", 12_000),
+  trackFallbackPipeline: timeoutFromEnv("TRACK_FALLBACK_PIPELINE_TIMEOUT_MS", 20_000),
+  search: timeoutFromEnv("SEARCH_TIMEOUT_MS", 18_000),
+  searchPipeline: timeoutFromEnv("SEARCH_PIPELINE_TIMEOUT_MS", 30_000),
+  resolve: timeoutFromEnv("RESOLVE_TIMEOUT_MS", 18_000),
+  resolveRetry: timeoutFromEnv("RESOLVE_RETRY_TIMEOUT_MS", 28_000),
+  resolveRecoveryNav: timeoutFromEnv("RESOLVE_RECOVERY_NAV_TIMEOUT_MS", 20_000),
 };
 const ALBUM_TRACKS_TIMEOUT_MS = 24_000;
 const ALBUM_TRACKS_PIPELINE_TIMEOUT_MS = 34_000;
 const RESOLVE_MAX_TRACK_RESULTS = 24;
 const STRONG_MATCH_SCORE = 140;
 const EXACT_MATCH_SCORE = 1000;
-const LOG_SEARCH_PIPELINE = process.env.LOG_SEARCH_PIPELINE !== "false";
-
-function buildResolveLogPrefix(context = {}) {
-  const parts = [];
-  if (context.jobId) {
-    parts.push(`job=${context.jobId}`);
-  }
-  if (context.trackTitle) {
-    parts.push(`track="${context.trackTitle}"`);
-  }
-  if (Number.isInteger(context.queryIndex) && Number.isInteger(context.queryTotal)) {
-    parts.push(`query=${context.queryIndex}/${context.queryTotal}`);
-  }
-  return parts.length ? `[resolve ${parts.join(" ")}]` : "[resolve]";
-}
-
-function logResolve(context, message) {
-  if (!LOG_SEARCH_PIPELINE) {
-    return;
-  }
-  console.log(`${buildResolveLogPrefix(context)} ${message}`);
-}
+const RESOLVE_SEARCH_ATTEMPTS = 2;
 
 function addUniqueText(list, seen, value) {
   const display = normalizeDisplayText(value);
@@ -74,6 +63,10 @@ function scoreText(candidate, target, exact, partial) {
     return exact;
   }
   return candidate.includes(target) || target.includes(candidate) ? partial : 0;
+}
+
+function isTimeoutError(error) {
+  return /timed out/i.test(error?.message || String(error || ""));
 }
 
 function buildTargetProfile(song) {
@@ -114,33 +107,18 @@ export function createSearchEngine(state, browserController) {
   async function searchTracksWithFallback(query) {
     const cached = getCachedTrackSearch(query);
     if (cached) {
-      if (LOG_SEARCH_PIPELINE) {
-        console.log(`[search tracks] cache hit q="${query}" count=${cached.length}`);
-      }
       return cached;
     }
 
     try {
-      const fastStartedAt = Date.now();
       const songs = await withTimeout(
         searchTracksFast(query, 25),
         TIMEOUTS.fastTrack,
         "Fast track search"
       );
-      if (LOG_SEARCH_PIPELINE) {
-        console.log(
-          `[search tracks] fast q="${query}" count=${songs.length} durationMs=${Date.now() - fastStartedAt}`
-        );
-      }
       setCachedTrackSearch(query, songs);
       return songs;
     } catch (fastSearchError) {
-      if (LOG_SEARCH_PIPELINE) {
-        console.log(
-          `[search tracks] fast failed q="${query}" error="${fastSearchError?.message || fastSearchError}"`
-        );
-      }
-      const fallbackStartedAt = Date.now();
       const songs = await runBrowserSearch(
         query,
         "tracks",
@@ -148,11 +126,6 @@ export function createSearchEngine(state, browserController) {
         TIMEOUTS.trackFallbackPipeline,
         "Track fallback search"
       );
-      if (LOG_SEARCH_PIPELINE) {
-        console.log(
-          `[search tracks] fallback q="${query}" count=${songs.length} durationMs=${Date.now() - fallbackStartedAt}`
-        );
-      }
       if (!songs.length) {
         throw fastSearchError;
       }
@@ -318,47 +291,41 @@ export function createSearchEngine(state, browserController) {
     return score;
   }
 
-  async function searchTrackCandidates(page, query, context = {}) {
+  async function searchTrackCandidates(page, query) {
     if (!query) {
       return [];
     }
 
-    const attempts = [
-      {
-        label: "fast",
-        timeoutMs: TIMEOUTS.resolveFast,
-        options: {fastResolve: true, maxTrackResults: RESOLVE_MAX_TRACK_RESULTS},
-      },
-      {
-        label: "steady",
-        timeoutMs: TIMEOUTS.resolveSteady,
-        options: {fastResolve: false, maxTrackResults: RESOLVE_MAX_TRACK_RESULTS},
-      },
-    ];
-
     let lastError = null;
-    for (const attempt of attempts) {
-      const startedAt = Date.now();
+    for (let attempt = 0; attempt < RESOLVE_SEARCH_ATTEMPTS; attempt += 1) {
+      const timeoutMs = attempt === 0 ? TIMEOUTS.resolve : TIMEOUTS.resolveRetry;
       try {
-        const candidates = await withTimeout(
-          searchSongs(page, query, "tracks", attempt.options),
-          attempt.timeoutMs,
-          `Resolve query "${query}" [${attempt.label}]`
+        const results = await withTimeout(
+          searchSongs(page, query, "tracks", {
+            fastResolve: attempt === 0,
+            maxTrackResults: RESOLVE_MAX_TRACK_RESULTS,
+          }),
+          timeoutMs,
+          `Resolve query "${query}"`
         );
-        logResolve(
-          context,
-          `strategy=${attempt.label} query="${query}" candidates=${candidates.length} durationMs=${Date.now() - startedAt}`
-        );
-        if (candidates.length > 0) {
-          return candidates;
+
+        if (results.length || attempt === RESOLVE_SEARCH_ATTEMPTS - 1) {
+          return results;
         }
       } catch (error) {
         lastError = error;
-        logResolve(
-          context,
-          `strategy=${attempt.label} query="${query}" failed durationMs=${Date.now() - startedAt} error="${error?.message || error}"`
-        );
+        if (!isTimeoutError(error) || attempt === RESOLVE_SEARCH_ATTEMPTS - 1) {
+          throw error;
+        }
       }
+
+      await page.waitForTimeout(300).catch(() => {});
+      await page
+        .goto(BASE_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: TIMEOUTS.resolveRecoveryNav,
+        })
+        .catch(() => {});
     }
 
     if (lastError) {
@@ -371,8 +338,7 @@ export function createSearchEngine(state, browserController) {
     onProgress({status: "preparing", phase, progress, ...toSongMeta(selectedSong)});
   }
 
-  async function resolveDownloadableSong(index, song, onProgress = () => {}, context = {}) {
-    const resolveStartedAt = Date.now();
+  async function resolveDownloadableSong(index, song, onProgress = () => {}) {
     let selectedSong = getSongFromRequest(index, song);
     if (!selectedSong && song?.title) {
       selectedSong = {...song, downloadable: song.downloadable !== false, element: null};
@@ -399,17 +365,9 @@ export function createSearchEngine(state, browserController) {
       artwork: selectedSong.artwork,
       duration: selectedSong.duration,
     };
-    const resolveContext = {
-      ...context,
-      trackTitle: originalMeta.title || selectedSong.title || "Unknown",
-    };
     const target = buildTargetProfile(selectedSong);
     const {page} = browserController.getBrowserInstance();
     const resolveQueries = buildResolveQueries(selectedSong);
-    logResolve(
-      resolveContext,
-      `start artist="${originalMeta.artist || ""}" album="${originalMeta.album || ""}" queries=${resolveQueries.length}`
-    );
 
     emitResolveProgress(onProgress, selectedSong, "resolving", 22);
 
@@ -427,21 +385,15 @@ export function createSearchEngine(state, browserController) {
 
       let candidates = [];
       try {
-        candidates = await searchTrackCandidates(page, resolveQueries[i], {
-          ...resolveContext,
-          queryIndex: i + 1,
-          queryTotal: resolveQueries.length,
-        });
+        candidates = await searchTrackCandidates(page, resolveQueries[i]);
       } catch (error) {
         resolveError = error;
         continue;
       }
 
       let foundExact = false;
-      let queryBestScore = -1;
       for (const candidate of candidates) {
         const score = scoreCandidateMatch(candidate, target);
-        queryBestScore = Math.max(queryBestScore, score);
         if (score > bestScore) {
           bestScore = score;
           bestCandidate = candidate;
@@ -451,14 +403,6 @@ export function createSearchEngine(state, browserController) {
           break;
         }
       }
-      logResolve(
-        {
-          ...resolveContext,
-          queryIndex: i + 1,
-          queryTotal: resolveQueries.length,
-        },
-        `evaluated candidates=${candidates.length} queryBestScore=${queryBestScore} overallBestScore=${bestScore}`
-      );
 
       if (foundExact || bestScore >= STRONG_MATCH_SCORE) {
         break;
@@ -467,26 +411,14 @@ export function createSearchEngine(state, browserController) {
 
     if (!bestCandidate?.element) {
       if (resolveError) {
-        logResolve(
-          resolveContext,
-          `failed durationMs=${Date.now() - resolveStartedAt} error="${resolveError?.message || resolveError}"`
-        );
         throw resolveError;
       }
-      logResolve(
-        resolveContext,
-        `failed durationMs=${Date.now() - resolveStartedAt} reason="no matching downloadable candidate"`
-      );
       throw new Error(
         `Could not resolve downloadable track element for "${originalMeta.title}".`
       );
     }
 
     selectedSong = mergeSongMetadata(bestCandidate, originalMeta);
-    logResolve(
-      resolveContext,
-      `resolved durationMs=${Date.now() - resolveStartedAt} bestScore=${bestScore} resolvedTitle="${selectedSong.title || ""}"`
-    );
     emitResolveProgress(onProgress, selectedSong, "resolved", 36);
     return selectedSong;
   }

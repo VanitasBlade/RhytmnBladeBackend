@@ -34,3 +34,16 @@ Server default: `http://localhost:3001`
 
 - Downloaded files are not persisted into a project `songs/` folder anymore.
 - Stream files are short-lived and cleaned up after transfer.
+
+## Timeout Tuning (Optional)
+
+If your host is slow (for example free-tier containers), set these env vars:
+
+- `DOWNLOAD_PIPELINE_TIMEOUT_MS` (default `300000`)
+- `RESOLVE_TIMEOUT_MS` (default `18000`)
+- `RESOLVE_RETRY_TIMEOUT_MS` (default `28000`)
+- `RESOLVE_RECOVERY_NAV_TIMEOUT_MS` (default `20000`)
+- `SEARCH_TIMEOUT_MS` (default `18000`)
+- `TRACK_FALLBACK_TIMEOUT_MS` (default `12000`)
+
+These help prevent resolver failures when the provider UI loads slowly.
