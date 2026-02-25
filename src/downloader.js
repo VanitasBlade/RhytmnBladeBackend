@@ -142,10 +142,11 @@ async function applyDownloadSetting(page, requestedSetting = DEFAULT_DOWNLOAD_SE
 }
 
 export async function downloadSong(page, songElement, downloadSetting = "Hi-Res", onProgress = null) {
-  console.log("Preparing to download...");
+  console.log("[downloader] preparing download", {requestedSetting: downloadSetting});
 
   emitProgress(onProgress, { phase: "preparing", progress: 8 });
   const appliedSetting = await applyDownloadSetting(page, downloadSetting);
+  console.log("[downloader] applied download setting", {appliedSetting});
   emitProgress(onProgress, { phase: "preparing", progress: 18, setting: appliedSetting });
 
   const downloadButton = songElement.locator(SELECTORS.downloadButton).first();
@@ -159,7 +160,11 @@ export async function downloadSong(page, songElement, downloadSetting = "Hi-Res"
   await page.waitForTimeout(500);
   emitProgress(onProgress, { phase: "preparing", progress: 32 });
 
-  console.log("Initiating download...");
+  const downloadStartTimeoutMs = getDownloadStartTimeoutMs(appliedSetting);
+  console.log("[downloader] waiting for browser download event", {
+    appliedSetting,
+    timeoutMs: downloadStartTimeoutMs,
+  });
   emitProgress(onProgress, { phase: "downloading", progress: 42 });
 
   let syntheticProgress = 42;
@@ -171,7 +176,6 @@ export async function downloadSong(page, songElement, downloadSetting = "Hi-Res"
     });
   }, 800);
 
-  const downloadStartTimeoutMs = getDownloadStartTimeoutMs(appliedSetting);
   let download;
   try {
     [download] = await Promise.all([
@@ -189,6 +193,8 @@ export async function downloadSong(page, songElement, downloadSetting = "Hi-Res"
     clearInterval(pulse);
   }
 
+  console.log("[downloader] browser download event received");
+
   emitProgress(onProgress, { phase: "downloading", progress: 94 });
   emitProgress(onProgress, { phase: "saving", progress: 97 });
 
@@ -203,6 +209,10 @@ export async function downloadSong(page, songElement, downloadSetting = "Hi-Res"
     .catch(() => null);
 
   emitProgress(onProgress, { phase: "done", progress: 100 });
+  console.log("[downloader] download file ready", {
+    filename,
+    bytes: fileSize,
+  });
   return {
     filename,
     filePath,

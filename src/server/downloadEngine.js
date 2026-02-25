@@ -25,6 +25,7 @@ const ERRORS = {
 const ACTIVE_STATUSES = new Set(["queued", "preparing", "downloading"]);
 const DOWNLOADING_PHASES = new Set(["downloading", "saving", "done"]);
 const DEFAULT_SETTING = "Hi-Res";
+const PROGRESS_LOG_STEP = 20;
 const fsStat = fs.promises.stat;
 const fsUnlink = fs.promises.unlink;
 
@@ -62,6 +63,36 @@ function normalizeSong(song) {
 export function createDownloadEngine({state, browserController, searchEngine}) {
   const resolveSongFromRequest = request =>
     searchEngine.getSongFromRequest(request.index, request.song) || request.song || null;
+
+  function logDownload(message, payload = null) {
+    if (payload) {
+      console.log(`[download-engine] ${message}`, payload);
+      return;
+    }
+    console.log(`[download-engine] ${message}`);
+  }
+
+  function summarizeRequest(request = {}) {
+    return {
+      index: Number.isInteger(request.index) ? request.index : null,
+      downloadSetting: request.downloadSetting || DEFAULT_SETTING,
+      title: request.song?.title || null,
+      artist: request.song?.artist || null,
+      tidalId: request.song?.tidalId || null,
+      url: request.song?.url || null,
+    };
+  }
+
+  function toProgressBucket(progress) {
+    if (!Number.isFinite(progress)) {
+      return -1;
+    }
+    const clamped = clampProgress(progress, 0);
+    if (clamped === 100) {
+      return 100;
+    }
+    return Math.floor(clamped / PROGRESS_LOG_STEP) * PROGRESS_LOG_STEP;
+  }
 
   function pruneExpiredDownloadedSongs() {
     const now = Date.now();
@@ -267,48 +298,55 @@ export function createDownloadEngine({state, browserController, searchEngine}) {
     return job;
   }
 
-  async function runDownloadPipelineFromRequest(request, onProgress = () => {}) {
+  async function runDownloadPipelineFromRequest(request, onProgress = () => {}, options = {}) {
     const {index, song, downloadSetting} = request;
-    return withTimeout(
-      browserController.runBrowserTask(async () => {
-        await browserController.initBrowser();
-        onProgress({status: "preparing", phase: "preparing", progress: 4});
-        const selectedSong = await searchEngine.resolveDownloadableSong(index, song, onProgress);
-        const songMeta = searchEngine.toSongMeta(selectedSong);
-        const {page} = browserController.getBrowserInstance();
-        const downloadResult = await downloadSong(
-          page,
-          selectedSong.element,
-          downloadSetting,
-          progressUpdate => {
-            const phase = progressUpdate?.phase || "downloading";
-            onProgress({
-              ...songMeta,
-              status: DOWNLOADING_PHASES.has(phase) ? "downloading" : "preparing",
-              ...progressUpdate,
-            });
-          }
-        );
-        const id = Date.now().toString();
-        saveDownloadedFile(id, downloadResult);
-        return {
-          id,
-          filename: downloadResult.filename,
-          filePath: downloadResult.filePath,
-          bytes: downloadResult.bytes,
-          selectedSong: applyFilenameMetadataFallback(
-            mergeSongMetadata(selectedSong, song || {}),
-            downloadResult.filename
-          ),
-        };
-      }),
-      DOWNLOAD_PIPELINE_TIMEOUT_MS,
-      "Download pipeline"
+    const taskLabel = String(options.taskLabel || "download-pipeline");
+    return browserController.runBrowserTask(
+      () =>
+        withTimeout(
+          (async () => {
+            await browserController.initBrowser();
+            onProgress({status: "preparing", phase: "preparing", progress: 4});
+            const selectedSong = await searchEngine.resolveDownloadableSong(index, song, onProgress);
+            const songMeta = searchEngine.toSongMeta(selectedSong);
+            const {page} = browserController.getBrowserInstance();
+            const downloadResult = await downloadSong(
+              page,
+              selectedSong.element,
+              downloadSetting,
+              progressUpdate => {
+                const phase = progressUpdate?.phase || "downloading";
+                onProgress({
+                  ...songMeta,
+                  status: DOWNLOADING_PHASES.has(phase) ? "downloading" : "preparing",
+                  ...progressUpdate,
+                });
+              }
+            );
+            const id = Date.now().toString();
+            saveDownloadedFile(id, downloadResult);
+            return {
+              id,
+              filename: downloadResult.filename,
+              filePath: downloadResult.filePath,
+              bytes: downloadResult.bytes,
+              selectedSong: applyFilenameMetadataFallback(
+                mergeSongMetadata(selectedSong, song || {}),
+                downloadResult.filename
+              ),
+            };
+          })(),
+          DOWNLOAD_PIPELINE_TIMEOUT_MS,
+          "Download pipeline"
+        ),
+      taskLabel
     );
   }
 
   async function runDownloadPipeline(payload, onProgress = () => {}) {
-    return runDownloadPipelineFromRequest(createDownloadRequest(payload), onProgress);
+    return runDownloadPipelineFromRequest(createDownloadRequest(payload), onProgress, {
+      taskLabel: "direct-download",
+    });
   }
 
   async function readDownloadedFileSize(filePath) {
@@ -323,10 +361,53 @@ export function createDownloadEngine({state, browserController, searchEngine}) {
   }
 
   async function executeDownloadJob(jobId, request) {
+    const startedAt = Date.now();
+    const requestSummary = summarizeRequest(request);
+    logDownload(`job ${jobId} started`, requestSummary);
+    let lastLoggedPhase = "queued";
+    let lastLoggedBucket = -1;
+
+    const logJobProgress = progressPatch => {
+      const phase = String(progressPatch?.phase || "").trim();
+      const progress = Number(progressPatch?.progress);
+      const nextBucket = toProgressBucket(progress);
+      const phaseChanged = Boolean(phase) && phase !== lastLoggedPhase;
+      const bucketChanged =
+        nextBucket >= 0 &&
+        nextBucket !== 100 &&
+        nextBucket !== lastLoggedBucket;
+
+      if (!phaseChanged && !bucketChanged) {
+        return;
+      }
+      if (phaseChanged) {
+        lastLoggedPhase = phase;
+      }
+      if (nextBucket >= 0) {
+        lastLoggedBucket = nextBucket;
+      }
+
+      const meta = {
+        phase: phase || lastLoggedPhase,
+      };
+      if (Number.isFinite(progress)) {
+        meta.progress = clampProgress(progress, 0);
+      }
+      if (progressPatch?.status) {
+        meta.status = progressPatch.status;
+      }
+      logDownload(`job ${jobId} progress`, meta);
+    };
+
     try {
-      const result = await runDownloadPipelineFromRequest(request, progressPatch => {
-        patchDownloadJob(jobId, {...progressPatch, error: null});
-      });
+      const result = await runDownloadPipelineFromRequest(
+        request,
+        progressPatch => {
+          patchDownloadJob(jobId, {...progressPatch, error: null});
+          logJobProgress(progressPatch);
+        },
+        {taskLabel: `download-job:${jobId}`}
+      );
       const bytes =
         Number(result.bytes) || (await readDownloadedFileSize(result.filePath));
       patchDownloadJob(jobId, {
@@ -342,17 +423,28 @@ export function createDownloadEngine({state, browserController, searchEngine}) {
           ...toPublicItem(result.selectedSong),
         },
       });
+      logDownload(`job ${jobId} completed`, {
+        durationMs: Date.now() - startedAt,
+        bytes: bytes || null,
+        filename: result.filename,
+      });
     } catch (error) {
+      const message = error?.message || String(error);
       patchDownloadJob(jobId, {
         status: "failed",
         phase: "failed",
-        error: error.message,
+        error: message,
+      });
+      logDownload(`job ${jobId} failed`, {
+        durationMs: Date.now() - startedAt,
+        error: message,
       });
     }
   }
 
   function startDownloadRequest(request, seedSong = null) {
     const job = createDownloadJob(request, seedSong);
+    logDownload(`job ${job.id} queued`, summarizeRequest(request));
     void executeDownloadJob(job.id, request);
     return state.downloadJobs.get(job.id);
   }
@@ -376,6 +468,7 @@ export function createDownloadEngine({state, browserController, searchEngine}) {
       throw new Error(ERRORS.notFound);
     }
     state.downloadJobs.delete(jobId);
+    logDownload(`job ${jobId} canceled`);
     return existing;
   }
 
@@ -414,6 +507,7 @@ export function createDownloadEngine({state, browserController, searchEngine}) {
       downloadSetting: request.downloadSetting,
       request,
     });
+    logDownload(`job ${jobId} retry queued`, summarizeRequest(request));
     void executeDownloadJob(jobId, request);
     return state.downloadJobs.get(jobId);
   }

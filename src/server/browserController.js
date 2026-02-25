@@ -3,10 +3,39 @@ import {createBrowser} from "../browser.js";
 import {BASE_URL} from "../config.js";
 
 export function createBrowserController(state) {
-  function runBrowserTask(task) {
-    const run = state.browserQueue.then(() => task());
+  let queuedTaskCount = 0;
+
+  function logQueue(message, payload = null) {
+    if (payload) {
+      console.log(`[browser-queue] ${message}`, payload);
+      return;
+    }
+    console.log(`[browser-queue] ${message}`);
+  }
+
+  function runBrowserTask(task, label = "browser-task") {
+    const waitingTasks = queuedTaskCount;
+    queuedTaskCount += 1;
+    if (waitingTasks > 0) {
+      logQueue(`queued ${label}`, {waitingTasks});
+    }
+
+    const run = state.browserQueue.then(async () => {
+      if (waitingTasks > 0) {
+        logQueue(`starting ${label} after queue wait`, {waitingTasks});
+      } else {
+        logQueue(`starting ${label}`);
+      }
+      return task();
+    });
+
     state.browserQueue = run.catch(() => {});
-    return run;
+    return run.finally(() => {
+      queuedTaskCount = Math.max(0, queuedTaskCount - 1);
+      if (queuedTaskCount > 0) {
+        logQueue(`completed ${label}`, {remainingTasks: queuedTaskCount});
+      }
+    });
   }
 
   async function initBrowser(authOverride = null) {

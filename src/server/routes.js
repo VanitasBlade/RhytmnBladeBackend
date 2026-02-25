@@ -77,6 +77,9 @@ export function registerRoutes({
         },
       });
     } catch (error) {
+      if (/timed out/i.test(errorMessage(error))) {
+        return sendApiError(res, 504, error);
+      }
       if (
         hasErrorText(
           error,
