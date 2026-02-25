@@ -22,7 +22,7 @@ const TIMEOUTS = {
   trackFallbackPipeline: 20_000,
   search: 18_000,
   searchPipeline: 30_000,
-  resolve: 9_000,
+  resolve: 18_000,
 };
 const ALBUM_TRACKS_TIMEOUT_MS = 24_000;
 const ALBUM_TRACKS_PIPELINE_TIMEOUT_MS = 34_000;
