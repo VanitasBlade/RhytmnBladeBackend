@@ -1,0 +1,4 @@
+/node_modules
+/songs
+server.out.log
+server.err.log
